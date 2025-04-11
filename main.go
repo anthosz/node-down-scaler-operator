@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -20,6 +21,13 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
+)
+
+const (
+	// Annotation key to enable scaling by the operator
+	ScaleAnnotationKey = "node-scaler.k8s.io/auto-scale"
+	// Annotation value to enable scaling
+	ScaleAnnotationValue = "true"
 )
 
 // NodeTracker keeps track of node states and original replicas
@@ -40,17 +48,21 @@ func NewNodeTracker() *NodeTracker {
 
 // Controller is the main operator controller
 type Controller struct {
-	clientset kubernetes.Interface
-	queue     workqueue.RateLimitingInterface
-	tracker   *NodeTracker
+	clientset       kubernetes.Interface
+	queue           workqueue.RateLimitingInterface
+	tracker         *NodeTracker
+	nodeLabels      string
+	checkInterval   time.Duration
 }
 
 // NewController creates a new Controller
-func NewController(clientset kubernetes.Interface) *Controller {
+func NewController(clientset kubernetes.Interface, nodeLabels string, checkInterval time.Duration) *Controller {
 	return &Controller{
-		clientset: clientset,
-		queue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node-scaler"),
-		tracker:   NewNodeTracker(),
+		clientset:     clientset,
+		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node-scaler"),
+		tracker:       NewNodeTracker(),
+		nodeLabels:    nodeLabels,
+		checkInterval: checkInterval,
 	}
 }
 
@@ -60,6 +72,8 @@ func (c *Controller) Run(ctx context.Context) {
 	defer c.queue.ShutDown()
 
 	klog.Info("Starting Node Scaler Controller")
+	klog.Infof("Monitoring nodes with labels: %s", c.nodeLabels)
+	klog.Infof("Check interval: %v", c.checkInterval)
 
 	// Initialize node states
 	c.initializeNodeStates()
@@ -76,12 +90,15 @@ func (c *Controller) Run(ctx context.Context) {
 
 // initializeNodeStates initializes the state of all nodes
 func (c *Controller) initializeNodeStates() {
-	nodes, err := c.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	nodes, err := c.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{
+		LabelSelector: c.nodeLabels,
+	})
 	if err != nil {
 		klog.Errorf("Failed to list nodes: %v", err)
 		return
 	}
 
+	klog.Infof("Found %d nodes matching label selector: %s", len(nodes.Items), c.nodeLabels)
 	for _, node := range nodes.Items {
 		isReady := isNodeReady(&node)
 		c.tracker.nodeStates[node.Name] = isReady
@@ -95,14 +112,20 @@ func (c *Controller) watchNodes(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(30 * time.Second):
-			nodes, err := c.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+		case <-time.After(c.checkInterval):
+			nodes, err := c.clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{
+				LabelSelector: c.nodeLabels,
+			})
 			if err != nil {
 				klog.Errorf("Failed to list nodes: %v", err)
 				continue
 			}
 
+			// Track which nodes we've seen in this iteration
+			seenNodes := make(map[string]bool)
+
 			for _, node := range nodes.Items {
+				seenNodes[node.Name] = true
 				currentState := isNodeReady(&node)
 				previousState, exists := c.tracker.nodeStates[node.Name]
 
@@ -110,6 +133,14 @@ func (c *Controller) watchNodes(ctx context.Context) {
 					klog.Infof("Node %s state changed: %v -> %v", node.Name, previousState, currentState)
 					c.tracker.nodeStates[node.Name] = currentState
 					c.queue.Add(node.Name)
+				}
+			}
+
+			// Handle nodes that have disappeared (no longer match the label selector)
+			for nodeName := range c.tracker.nodeStates {
+				if !seenNodes[nodeName] {
+					klog.Infof("Node %s no longer matches the label selector, removing from tracker", nodeName)
+					delete(c.tracker.nodeStates, nodeName)
 				}
 			}
 		}
@@ -175,6 +206,14 @@ func getResourceKey(kind, namespace, name string) string {
 	return fmt.Sprintf("%s/%s/%s", kind, namespace, name)
 }
 
+// hasScaleAnnotation checks if a resource has the auto-scale annotation
+func hasScaleAnnotation(annotations map[string]string) bool {
+	if value, exists := annotations[ScaleAnnotationKey]; exists && value == ScaleAnnotationValue {
+		return true
+	}
+	return false
+}
+
 // scaleDownResources scales down resources on the unhealthy node
 func (c *Controller) scaleDownResources(nodeName string) error {
 	// Get pods running on the node
@@ -213,10 +252,16 @@ func (c *Controller) scaleDownResources(nodeName string) error {
 				continue
 			}
 
-			// Scale down the Deployment
+			// Scale down the Deployment if it has the annotation
 			deploy, err := c.clientset.AppsV1().Deployments(pod.Namespace).Get(context.Background(), deployOwnerRef.Name, metav1.GetOptions{})
 			if err != nil {
 				klog.Warningf("Failed to get Deployment %s/%s: %v", pod.Namespace, deployOwnerRef.Name, err)
+				continue
+			}
+
+			// Check if Deployment has the auto-scale annotation
+			if !hasScaleAnnotation(deploy.Annotations) {
+				klog.V(4).Infof("Skipping Deployment %s/%s: missing auto-scale annotation", deploy.Namespace, deploy.Name)
 				continue
 			}
 
@@ -234,10 +279,16 @@ func (c *Controller) scaleDownResources(nodeName string) error {
 				}
 			}
 		} else if ownerRef.Kind == "StatefulSet" {
-			// Scale down the StatefulSet
+			// Scale down the StatefulSet if it has the annotation
 			sts, err := c.clientset.AppsV1().StatefulSets(pod.Namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
 			if err != nil {
 				klog.Warningf("Failed to get StatefulSet %s/%s: %v", pod.Namespace, ownerRef.Name, err)
+				continue
+			}
+
+			// Check if StatefulSet has the auto-scale annotation
+			if !hasScaleAnnotation(sts.Annotations) {
+				klog.V(4).Infof("Skipping StatefulSet %s/%s: missing auto-scale annotation", sts.Namespace, sts.Name)
 				continue
 			}
 
@@ -262,7 +313,7 @@ func (c *Controller) scaleDownResources(nodeName string) error {
 
 // restoreResources restores resources that were scaled down
 func (c *Controller) restoreResources(nodeName string) error {
-	// Restore Deployments
+	// Restore Deployments and StatefulSets
 	for resourceKey, replicas := range c.tracker.originalReplicas {
 		kind, namespace, name, err := parseResourceKey(resourceKey)
 		if err != nil {
@@ -277,6 +328,13 @@ func (c *Controller) restoreResources(nodeName string) error {
 					delete(c.tracker.originalReplicas, resourceKey)
 				}
 				klog.Warningf("Failed to get Deployment %s/%s: %v", namespace, name, err)
+				continue
+			}
+
+			// Verify annotation still exists before restoring
+			if !hasScaleAnnotation(deploy.Annotations) {
+				klog.Infof("Skipping restoration of Deployment %s/%s: annotation removed", namespace, name)
+				delete(c.tracker.originalReplicas, resourceKey)
 				continue
 			}
 
@@ -296,6 +354,13 @@ func (c *Controller) restoreResources(nodeName string) error {
 					delete(c.tracker.originalReplicas, resourceKey)
 				}
 				klog.Warningf("Failed to get StatefulSet %s/%s: %v", namespace, name, err)
+				continue
+			}
+
+			// Verify annotation still exists before restoring
+			if !hasScaleAnnotation(sts.Annotations) {
+				klog.Infof("Skipping restoration of StatefulSet %s/%s: annotation removed", namespace, name)
+				delete(c.tracker.originalReplicas, resourceKey)
 				continue
 			}
 
@@ -326,30 +391,37 @@ func parseResourceKey(key string) (string, string, string, error) {
 
 func main() {
 	klog.InitFlags(nil)
+
+	// Define configuration flags
+	var nodeLabels string
+	var checkIntervalSeconds int
+	flag.StringVar(&nodeLabels, "node-labels", "", "Label selector to filter which nodes to monitor (e.g. 'role=worker,env=prod')")
+	flag.IntVar(&checkIntervalSeconds, "check-interval", 30, "How often to check node status in seconds")
 	flag.Parse()
 
 	// Get in-cluster config
-	config, err := rest.InClusterConfig()
+	kubeConfig, err := rest.InClusterConfig()
 	if err != nil {
 		// Try to use kubeconfig if in-cluster config fails
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			kubeconfig = os.Getenv("HOME") + "/.kube/config"
+		kubeconfigPath := os.Getenv("KUBECONFIG")
+		if kubeconfigPath == "" {
+			kubeconfigPath = os.Getenv("HOME") + "/.kube/config"
 		}
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		kubeConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 		if err != nil {
 			klog.Fatalf("Failed to get Kubernetes config: %v", err)
 		}
 	}
 
 	// Create Kubernetes clientset
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
 		klog.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	// Create controller
-	controller := NewController(clientset)
+	// Create controller with check interval
+	checkInterval := time.Duration(checkIntervalSeconds) * time.Second
+	controller := NewController(clientset, nodeLabels, checkInterval)
 
 	// Set up leader election
 	id := uuid.New().String()
