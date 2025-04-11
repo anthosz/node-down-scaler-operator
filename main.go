@@ -20,12 +20,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+	
+	// Import specific listers
+	corelisters "k8s.io/client-go/listers/core/v1"
+	appslisters "k8s.io/client-go/listers/apps/v1"
 )
 
 const (
@@ -41,9 +44,11 @@ type Controller struct {
 	deployInformer cache.SharedIndexInformer
 	stsInformer    cache.SharedIndexInformer
 	workqueue      workqueue.RateLimitingInterface
-	nodeLister     cache.GenericLister
-	deployLister   cache.GenericLister
-	stsLister      cache.GenericLister
+	
+	// Use specific lister types instead of GenericLister
+	nodeLister     corelisters.NodeLister
+	deployLister   appslisters.DeploymentLister
+	stsLister      appslisters.StatefulSetLister
 }
 
 func NewController(kubeClient kubernetes.Interface, factory informers.SharedInformerFactory) *Controller {
@@ -59,6 +64,8 @@ func NewController(kubeClient kubernetes.Interface, factory informers.SharedInfo
 		deployInformer: deployInformer,
 		stsInformer:    stsInformer,
 		workqueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Nodes"),
+		
+		// Use correct lister types
 		nodeLister:     factory.Core().V1().Nodes().Lister(),
 		deployLister:   factory.Apps().V1().Deployments().Lister(),
 		stsLister:      factory.Apps().V1().StatefulSets().Lister(),
@@ -176,7 +183,7 @@ func (c *Controller) syncHandler(key string) error {
 		return nil
 	}
 
-	// Get node by name
+	// Get node by name - use NodeLister directly
 	node, err := c.nodeLister.Get(name)
 	if errors.IsNotFound(err) {
 		klog.Infof("Node %s no longer exists", name)
@@ -188,8 +195,7 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	// Check if node is ready
-	nodeObj := node.(*corev1.Node)
-	if isNodeReady(nodeObj) {
+	if isNodeReady(node) {
 		return c.handleNodeReady(name)
 	} else {
 		return c.handleNodeNotReady(name)
