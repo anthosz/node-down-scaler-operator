@@ -4,7 +4,8 @@ COPY *go* ./
 RUN go mod tidy && go mod download && CGO_ENABLED=0 GOOS=linux go build -a -o node-down-scaler .
 
 FROM alpine:3.18
-RUN apk --no-cache add ca-certificates
-WORKDIR /srv/
-COPY --from=builder /app/node-down-scaler /srv
-CMD ["./node-down-scaler"]
+#RUN apk --no-cache add ca-certificates
+COPY --from=builder /app/node-down-scaler /usr/bin/node-down-scaler
+RUN adduser -D -u 1000 operator
+USER operator
+CMD ["node-down-scaler"]
