@@ -114,6 +114,7 @@ func (c *Controller) enqueueNode(obj interface{}) {
 	c.workqueue.Add(key)
 }
 
+// Run starts the controller
 func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	defer runtime.HandleCrash()
 	defer c.workqueue.ShutDown()
@@ -439,10 +440,8 @@ func main() {
 				stopCh := make(chan struct{})
 				factory.Start(stopCh)
 
-				// Run controller
-				if err := controller.Run(2, stopCh); err != nil {
-					klog.Fatalf("Error running controller: %s", err.Error())
-				}
+				// Run controller - fixed here to not use return value
+				controller.Run(2, stopCh)
 			},
 			OnStoppedLeading: func() {
 				klog.Info("Leader election lost")
