@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -26,6 +27,8 @@ const (
 	scaleAnnotation = "node-down-scaler/enabled"
 	// Annotation to store original replicas count
 	originalReplicasAnnotation = "node-down-scaler/original-replicas"
+	// Maximum retry attempts
+	maxRetries = 5
 )
 
 type OperatorConfig struct {
@@ -256,115 +259,125 @@ func isNodeDown(node *corev1.Node) bool {
 func scaleResourceDown(ctx context.Context, kubeClient *kubernetes.Clientset, resourceType, namespace, name string) {
 	klog.Infof("Scaling down %s %s/%s", resourceType, namespace, name)
 
-	var originalReplicas string
-
 	switch resourceType {
 	case "deployment":
-		deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				klog.Warningf("Deployment %s/%s not found", namespace, name)
-				return
+		// Use RetryOnConflict to automatically retry in case of conflicts
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version of the deployment
+			deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					klog.Warningf("Deployment %s/%s not found", namespace, name)
+					return nil
+				}
+				return err
 			}
-			klog.Errorf("Error getting deployment %s/%s: %v", namespace, name, err)
-			return
-		}
 
-		// Check if already scaled down
-		if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
-			klog.V(3).Infof("Deployment %s/%s already scaled to 0", namespace, name)
-			return
-		}
+			// Check if already scaled down
+			if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
+				klog.V(3).Infof("Deployment %s/%s already scaled to 0", namespace, name)
+				return nil
+			}
 
-		// Store original replicas
-		if deployment.Spec.Replicas != nil {
-			originalReplicas = fmt.Sprintf("%d", *deployment.Spec.Replicas)
+			// Store original replicas if not already annotated
+			if _, exists := deployment.Annotations[originalReplicasAnnotation]; !exists {
+				// Ensure annotations map exists
+				if deployment.Annotations == nil {
+					deployment.Annotations = make(map[string]string)
+				}
+
+				// Store original replicas
+				if deployment.Spec.Replicas != nil {
+					deployment.Annotations[originalReplicasAnnotation] = fmt.Sprintf("%d", *deployment.Spec.Replicas)
+				} else {
+					deployment.Annotations[originalReplicasAnnotation] = "1" // Default value
+				}
+
+				// Update annotations first
+				_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+				if err != nil {
+					return err
+				}
+
+				// Get the latest version again after annotation update
+				deployment, err = kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+			}
+
+			// Scale to 0
+			zero := int32(0)
+			deployment.Spec.Replicas = &zero
+			_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+			return err
+		})
+
+		if err != nil {
+			klog.Errorf("Error scaling down deployment %s/%s after retries: %v", namespace, name, err)
 		} else {
-			originalReplicas = "1" // Default value
-		}
-
-		// Check if already annotated
-		if val, exists := deployment.Annotations[originalReplicasAnnotation]; exists && val != "" {
-			klog.V(3).Infof("Deployment %s/%s already has original replicas annotation: %s", namespace, name, val)
-			return
-		}
-
-		// Add annotation
-		if deployment.Annotations == nil {
-			deployment.Annotations = make(map[string]string)
-		}
-		deployment.Annotations[originalReplicasAnnotation] = originalReplicas
-
-		// Update annotations
-		_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error updating deployment annotations %s/%s: %v", namespace, name, err)
-			return
-		}
-
-		// Scale to 0
-		zero := int32(0)
-		deployment.Spec.Replicas = &zero
-		_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error scaling down deployment %s/%s: %v", namespace, name, err)
-			return
+			klog.Infof("Successfully scaled down deployment %s/%s to 0", namespace, name)
 		}
 
 	case "statefulset":
-		statefulset, err := kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				klog.Warningf("StatefulSet %s/%s not found", namespace, name)
-				return
+		// Use RetryOnConflict to automatically retry in case of conflicts
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version of the statefulset
+			statefulset, err := kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					klog.Warningf("StatefulSet %s/%s not found", namespace, name)
+					return nil
+				}
+				return err
 			}
-			klog.Errorf("Error getting statefulset %s/%s: %v", namespace, name, err)
-			return
-		}
 
-		// Check if already scaled down
-		if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == 0 {
-			klog.V(3).Infof("StatefulSet %s/%s already scaled to 0", namespace, name)
-			return
-		}
+			// Check if already scaled down
+			if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == 0 {
+				klog.V(3).Infof("StatefulSet %s/%s already scaled to 0", namespace, name)
+				return nil
+			}
 
-		// Store original replicas
-		if statefulset.Spec.Replicas != nil {
-			originalReplicas = fmt.Sprintf("%d", *statefulset.Spec.Replicas)
+			// Store original replicas if not already annotated
+			if _, exists := statefulset.Annotations[originalReplicasAnnotation]; !exists {
+				// Ensure annotations map exists
+				if statefulset.Annotations == nil {
+					statefulset.Annotations = make(map[string]string)
+				}
+
+				// Store original replicas
+				if statefulset.Spec.Replicas != nil {
+					statefulset.Annotations[originalReplicasAnnotation] = fmt.Sprintf("%d", *statefulset.Spec.Replicas)
+				} else {
+					statefulset.Annotations[originalReplicasAnnotation] = "1" // Default value
+				}
+
+				// Update annotations first
+				_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
+				if err != nil {
+					return err
+				}
+
+				// Get the latest version again after annotation update
+				statefulset, err = kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+			}
+
+			// Scale to 0
+			zero := int32(0)
+			statefulset.Spec.Replicas = &zero
+			_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
+			return err
+		})
+
+		if err != nil {
+			klog.Errorf("Error scaling down statefulset %s/%s after retries: %v", namespace, name, err)
 		} else {
-			originalReplicas = "1" // Default value
-		}
-
-		// Check if already annotated
-		if val, exists := statefulset.Annotations[originalReplicasAnnotation]; exists && val != "" {
-			klog.V(3).Infof("StatefulSet %s/%s already has original replicas annotation: %s", namespace, name, val)
-			return
-		}
-
-		// Add annotation
-		if statefulset.Annotations == nil {
-			statefulset.Annotations = make(map[string]string)
-		}
-		statefulset.Annotations[originalReplicasAnnotation] = originalReplicas
-
-		// Update annotations
-		_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error updating statefulset annotations %s/%s: %v", namespace, name, err)
-			return
-		}
-
-		// Scale to 0
-		zero := int32(0)
-		statefulset.Spec.Replicas = &zero
-		_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error scaling down statefulset %s/%s: %v", namespace, name, err)
-			return
+			klog.Infof("Successfully scaled down statefulset %s/%s to 0", namespace, name)
 		}
 	}
-
-	klog.Infof("Successfully scaled down %s %s/%s from %s to 0", resourceType, namespace, name, originalReplicas)
 }
 
 // Scale up a deployment or statefulset to its original replicas count
@@ -373,101 +386,119 @@ func scaleResourceUp(ctx context.Context, kubeClient *kubernetes.Clientset, reso
 
 	switch resourceType {
 	case "deployment":
-		deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				klog.Warningf("Deployment %s/%s not found", namespace, name)
-				return
+		// Use RetryOnConflict to automatically retry in case of conflicts
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version of the deployment
+			deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					klog.Warningf("Deployment %s/%s not found", namespace, name)
+					return nil
+				}
+				return err
 			}
-			klog.Errorf("Error getting deployment %s/%s: %v", namespace, name, err)
-			return
-		}
 
-		// Get original replicas from annotation
-		originalReplicasStr, exists := deployment.Annotations[originalReplicasAnnotation]
-		if !exists {
-			klog.V(3).Infof("Deployment %s/%s has no original replicas annotation", namespace, name)
-			return
-		}
-
-		// Parse original replicas
-		originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
-		if err != nil {
-			klog.Errorf("Error parsing original replicas annotation for deployment %s/%s: %v", namespace, name, err)
-			return
-		}
-		originalReplicas := int32(originalReplicasInt)
-
-		// Check if already scaled up
-		if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == originalReplicas {
-			klog.V(3).Infof("Deployment %s/%s already scaled to original replicas: %d", namespace, name, originalReplicas)
-			return
-		}
-
-		// Scale back to original
-		deployment.Spec.Replicas = &originalReplicas
-		_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error scaling up deployment %s/%s: %v", namespace, name, err)
-			return
-		}
-
-		// Remove annotation
-		delete(deployment.Annotations, originalReplicasAnnotation)
-		_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error removing annotation from deployment %s/%s: %v", namespace, name, err)
-			return
-		}
-
-	case "statefulset":
-		statefulset, err := kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				klog.Warningf("StatefulSet %s/%s not found", namespace, name)
-				return
+			// Get original replicas from annotation
+			originalReplicasStr, exists := deployment.Annotations[originalReplicasAnnotation]
+			if !exists {
+				klog.V(3).Infof("Deployment %s/%s has no original replicas annotation", namespace, name)
+				return nil
 			}
-			klog.Errorf("Error getting statefulset %s/%s: %v", namespace, name, err)
-			return
-		}
 
-		// Get original replicas from annotation
-		originalReplicasStr, exists := statefulset.Annotations[originalReplicasAnnotation]
-		if !exists {
-			klog.V(3).Infof("StatefulSet %s/%s has no original replicas annotation", namespace, name)
-			return
-		}
+			// Parse original replicas
+			originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
+			if err != nil {
+				return fmt.Errorf("error parsing original replicas annotation: %v", err)
+			}
+			originalReplicas := int32(originalReplicasInt)
 
-		// Parse original replicas
-		originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
+			// Check if already scaled up
+			if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == originalReplicas {
+				klog.V(3).Infof("Deployment %s/%s already scaled to original replicas: %d", namespace, name, originalReplicas)
+				return nil
+			}
+
+			// Scale back to original
+			deployment.Spec.Replicas = &originalReplicas
+			_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+			if err != nil {
+				return err
+			}
+
+			// Get the latest version again after scale update
+			deployment, err = kubeClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+
+			// Remove annotation
+			delete(deployment.Annotations, originalReplicasAnnotation)
+			_, err = kubeClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+			return err
+		})
+
 		if err != nil {
-			klog.Errorf("Error parsing original replicas annotation for statefulset %s/%s: %v", namespace, name, err)
-			return
-		}
-		originalReplicas := int32(originalReplicasInt)
-
-		// Check if already scaled up
-		if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == originalReplicas {
-			klog.V(3).Infof("StatefulSet %s/%s already scaled to original replicas: %d", namespace, name, originalReplicas)
-			return
+			klog.Errorf("Error scaling up deployment %s/%s after retries: %v", namespace, name, err)
+		} else {
+			klog.Infof("Successfully scaled up deployment %s/%s to original replica count", namespace, name)
 		}
 
-		// Scale back to original
-		statefulset.Spec.Replicas = &originalReplicas
-		_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
+	case "statefulset"::po
+		// Use RetryOnConflict to automatically retry in case of conflicts
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version of the statefulset
+			statefulset, err := kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					klog.Warningf("StatefulSet %s/%s not found", namespace, name)
+					return nil
+				}
+				return err
+			}
+
+			// Get original replicas from annotation
+			originalReplicasStr, exists := statefulset.Annotations[originalReplicasAnnotation]
+			if !exists {
+				klog.V(3).Infof("StatefulSet %s/%s has no original replicas annotation", namespace, name)
+				return nil
+			}
+
+			// Parse original replicas
+			originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
+			if err != nil {
+				return fmt.Errorf("error parsing original replicas annotation: %v", err)
+			}
+			originalReplicas := int32(originalReplicasInt)
+
+			// Check if already scaled up
+			if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == originalReplicas {
+				klog.V(3).Infof("StatefulSet %s/%s already scaled to original replicas: %d", namespace, name, originalReplicas)
+				return nil
+			}
+
+			// Scale back to original
+			statefulset.Spec.Replicas = &originalReplicas
+			_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
+			if err != nil {
+				return err
+			}
+
+			// Get the latest version again after scale update
+			statefulset, err = kubeClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+
+			// Remove annotation
+			delete(statefulset.Annotations, originalReplicasAnnotation)
+			_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
+			return err
+		})
+
 		if err != nil {
-			klog.Errorf("Error scaling up statefulset %s/%s: %v", namespace, name, err)
-			return
-		}
-
-		// Remove annotation
-		delete(statefulset.Annotations, originalReplicasAnnotation)
-		_, err = kubeClient.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, metav1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("Error removing annotation from statefulset %s/%s: %v", namespace, name, err)
-			return
+			klog.Errorf("Error scaling up statefulset %s/%s after retries: %v", namespace, name, err)
+		} else {
+			klog.Infof("Successfully scaled up statefulset %s/%s to original replica count", namespace, name)
 		}
 	}
-
-	klog.Infof("Successfully scaled up %s %s/%s to original replica count", resourceType, namespace, name)
 }
