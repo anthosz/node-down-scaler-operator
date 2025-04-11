@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -241,9 +243,9 @@ func reconcile(ctx context.Context, kubeClient *kubernetes.Clientset, nodeSelect
 }
 
 // Check if a node is considered down
-func isNodeDown(node *metav1.ObjectMeta) bool {
+func isNodeDown(node *corev1.Node) bool {
 	for _, condition := range node.Status.Conditions {
-		if condition.Type == "Ready" && condition.Status != "True" {
+		if condition.Type == corev1.NodeReady && condition.Status != corev1.ConditionTrue {
 			return true
 		}
 	}
@@ -254,9 +256,7 @@ func isNodeDown(node *metav1.ObjectMeta) bool {
 func scaleResourceDown(ctx context.Context, kubeClient *kubernetes.Clientset, resourceType, namespace, name string) {
 	klog.Infof("Scaling down %s %s/%s", resourceType, namespace, name)
 
-	var currentReplicas *int32
 	var originalReplicas string
-	var err error
 
 	switch resourceType {
 	case "deployment":
@@ -391,11 +391,12 @@ func scaleResourceUp(ctx context.Context, kubeClient *kubernetes.Clientset, reso
 		}
 
 		// Parse original replicas
-		var originalReplicas int32
-		if _, err := fmt.Sscanf(originalReplicasStr, "%d", &originalReplicas); err != nil {
+		originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
+		if err != nil {
 			klog.Errorf("Error parsing original replicas annotation for deployment %s/%s: %v", namespace, name, err)
 			return
 		}
+		originalReplicas := int32(originalReplicasInt)
 
 		// Check if already scaled up
 		if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == originalReplicas {
@@ -438,11 +439,12 @@ func scaleResourceUp(ctx context.Context, kubeClient *kubernetes.Clientset, reso
 		}
 
 		// Parse original replicas
-		var originalReplicas int32
-		if _, err := fmt.Sscanf(originalReplicasStr, "%d", &originalReplicas); err != nil {
+		originalReplicasInt, err := strconv.Atoi(originalReplicasStr)
+		if err != nil {
 			klog.Errorf("Error parsing original replicas annotation for statefulset %s/%s: %v", namespace, name, err)
 			return
 		}
+		originalReplicas := int32(originalReplicasInt)
 
 		// Check if already scaled up
 		if statefulset.Spec.Replicas != nil && *statefulset.Spec.Replicas == originalReplicas {
