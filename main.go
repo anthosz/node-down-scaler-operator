@@ -1,349 +1,472 @@
 package main
 
 import (
-        "context"
-        "flag"
-        "fmt"
-        "os"
-        "strings"
-        "time"
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-        corev1 "k8s.io/api/core/v1"
-        appsv1 "k8s.io/api/apps/v1"
-        metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-        "k8s.io/apimachinery/pkg/labels"
-        "k8s.io/client-go/kubernetes"
-        "k8s.io/client-go/rest"
-        "k8s.io/client-go/tools/clientcmd"
-        "k8s.io/client-go/tools/leaderelection"
-        "k8s.io/client-go/tools/leaderelection/resourcelock"
-        "k8s.io/klog/v2"
+	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
-var (
-        masterURL      string
-        kubeconfig     string
-        namespace      string
-        labelSelector  string
-        interval       int
-        lockName       string
-        configMapName  string
-        configMapNs    string
+const (
+	// Annotation to mark resources to be managed by this operator
+	watchAnnotation = "node-watcher.k8s.io/watch"
+	// Annotation to remember original scale
+	originalScaleAnnotation = "node-watcher.k8s.io/original-scale"
 )
 
-type WorkloadConfig struct {
-        Name      string `json:"name"`
-        Namespace string `json:"namespace"`
-        Type      string `json:"type"` // "deployment" ou "statefulset"
+type Controller struct {
+	kubeClient     kubernetes.Interface
+	nodeInformer   cache.SharedIndexInformer
+	deployInformer cache.SharedIndexInformer
+	stsInformer    cache.SharedIndexInformer
+	workqueue      workqueue.RateLimitingInterface
+	nodeLister     cache.GenericLister
+	deployLister   cache.GenericLister
+	stsLister      cache.GenericLister
 }
 
-func init() {
-        flag.StringVar(&kubeconfig, "kubeconfig", "", "Chemin vers le fichier kubeconfig")
-        flag.StringVar(&masterURL, "master", "", "URL de l'API Kubernetes")
-        flag.StringVar(&namespace, "namespace", "", "Namespace à surveiller (vide pour tous)")
-        flag.StringVar(&labelSelector, "labels", "scale-to-zero=true", "Sélecteur de labels pour les workloads à scaler")
-        flag.IntVar(&interval, "interval", 30, "Intervalle de vérification en secondes")
-        flag.StringVar(&lockName, "lock-name", "node-down-scaler", "Nom de la ressource pour l'élection du leader")
-        flag.StringVar(&configMapName, "config", "scale-to-zero-config", "Nom de la ConfigMap contenant la configuration des workloads")
-        flag.StringVar(&configMapNs, "config-namespace", "kube-system", "Namespace de la ConfigMap de configuration")
+func NewController(kubeClient kubernetes.Interface, factory informers.SharedInformerFactory) *Controller {
+	// Set up informers
+	nodeInformer := factory.Core().V1().Nodes().Informer()
+	deployInformer := factory.Apps().V1().Deployments().Informer()
+	stsInformer := factory.Apps().V1().StatefulSets().Informer()
+
+	// Create controller
+	controller := &Controller{
+		kubeClient:     kubeClient,
+		nodeInformer:   nodeInformer,
+		deployInformer: deployInformer,
+		stsInformer:    stsInformer,
+		workqueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Nodes"),
+		nodeLister:     factory.Core().V1().Nodes().Lister(),
+		deployLister:   factory.Apps().V1().Deployments().Lister(),
+		stsLister:      factory.Apps().V1().StatefulSets().Lister(),
+	}
+
+	// Set up event handlers
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.enqueueNode,
+		UpdateFunc: func(old, new interface{}) {
+			oldNode := old.(*corev1.Node)
+			newNode := new.(*corev1.Node)
+			if nodeReadyStatusChanged(oldNode, newNode) {
+				controller.enqueueNode(newNode)
+			}
+		},
+		DeleteFunc: controller.enqueueNode,
+	})
+
+	return controller
+}
+
+// nodeReadyStatusChanged checks if a node's ready status has changed
+func nodeReadyStatusChanged(oldNode, newNode *corev1.Node) bool {
+	oldReady := isNodeReady(oldNode)
+	newReady := isNodeReady(newNode)
+	return oldReady != newReady
+}
+
+// isNodeReady checks if a node is in Ready status
+func isNodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (c *Controller) enqueueNode(obj interface{}) {
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		runtime.HandleError(err)
+		return
+	}
+	c.workqueue.Add(key)
+}
+
+func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
+	defer runtime.HandleCrash()
+	defer c.workqueue.ShutDown()
+
+	klog.Info("Starting Node Watcher controller")
+
+	klog.Info("Waiting for informer caches to sync")
+	if !cache.WaitForCacheSync(stopCh, 
+		c.nodeInformer.HasSynced, 
+		c.deployInformer.HasSynced, 
+		c.stsInformer.HasSynced) {
+		klog.Fatal("Failed to wait for caches to sync")
+	}
+
+	klog.Info("Starting workers")
+	for i := 0; i < workers; i++ {
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
+
+	klog.Info("Started workers")
+	<-stopCh
+	klog.Info("Shutting down workers")
+}
+
+func (c *Controller) runWorker() {
+	for c.processNextWorkItem() {
+	}
+}
+
+func (c *Controller) processNextWorkItem() bool {
+	obj, shutdown := c.workqueue.Get()
+	if shutdown {
+		return false
+	}
+
+	// We wrap this block in a func so we can defer c.workqueue.Done.
+	err := func(obj interface{}) error {
+		defer c.workqueue.Done(obj)
+		var key string
+		var ok bool
+		if key, ok = obj.(string); !ok {
+			c.workqueue.Forget(obj)
+			runtime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			return nil
+		}
+		if err := c.syncHandler(key); err != nil {
+			c.workqueue.AddRateLimited(key)
+			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
+		}
+		c.workqueue.Forget(obj)
+		klog.Infof("Successfully synced '%s'", key)
+		return nil
+	}(obj)
+
+	if err != nil {
+		runtime.HandleError(err)
+		return true
+	}
+
+	return true
+}
+
+func (c *Controller) syncHandler(key string) error {
+	_, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		return nil
+	}
+
+	// Get node by name
+	node, err := c.nodeLister.Get(name)
+	if errors.IsNotFound(err) {
+		klog.Infof("Node %s no longer exists", name)
+		// Node is deleted, treat it as not ready
+		return c.handleNodeNotReady(name)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Check if node is ready
+	nodeObj := node.(*corev1.Node)
+	if isNodeReady(nodeObj) {
+		return c.handleNodeReady(name)
+	} else {
+		return c.handleNodeNotReady(name)
+	}
+}
+
+func (c *Controller) handleNodeReady(nodeName string) error {
+	klog.Infof("Node %s is Ready, scaling up resources if needed", nodeName)
+
+	// Scale up deployments
+	deployments, err := c.kubeClient.AppsV1().Deployments("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, deploy := range deployments.Items {
+		if value, exists := deploy.Annotations[watchAnnotation]; exists && value == "true" {
+			originalScaleStr, exists := deploy.Annotations[originalScaleAnnotation]
+			if exists {
+				c.scaleDeploymentUp(&deploy, originalScaleStr)
+			}
+		}
+	}
+
+	// Scale up statefulsets
+	statefulsets, err := c.kubeClient.AppsV1().StatefulSets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, sts := range statefulsets.Items {
+		if value, exists := sts.Annotations[watchAnnotation]; exists && value == "true" {
+			originalScaleStr, exists := sts.Annotations[originalScaleAnnotation]
+			if exists {
+				c.scaleStatefulSetUp(&sts, originalScaleStr)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) handleNodeNotReady(nodeName string) error {
+	klog.Infof("Node %s is NotReady, scaling down resources if needed", nodeName)
+
+	// Scale down deployments
+	deployments, err := c.kubeClient.AppsV1().Deployments("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, deploy := range deployments.Items {
+		if value, exists := deploy.Annotations[watchAnnotation]; exists && value == "true" {
+			c.scaleDeploymentDown(&deploy)
+		}
+	}
+
+	// Scale down statefulsets
+	statefulsets, err := c.kubeClient.AppsV1().StatefulSets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, sts := range statefulsets.Items {
+		if value, exists := sts.Annotations[watchAnnotation]; exists && value == "true" {
+			c.scaleStatefulSetDown(&sts)
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) scaleDeploymentDown(deploy *appsv1.Deployment) {
+	// Skip if already scaled to 0
+	if *deploy.Spec.Replicas == 0 {
+		return
+	}
+
+	// Remember original scale
+	originalScale := fmt.Sprintf("%d", *deploy.Spec.Replicas)
+	
+	// Update annotations
+	if deploy.Annotations == nil {
+		deploy.Annotations = make(map[string]string)
+	}
+	deploy.Annotations[originalScaleAnnotation] = originalScale
+	
+	// Set replicas to 0
+	replicas := int32(0)
+	deploy.Spec.Replicas = &replicas
+	
+	// Update deployment
+	_, err := c.kubeClient.AppsV1().Deployments(deploy.Namespace).Update(context.Background(), deploy, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to scale down deployment %s/%s: %v", deploy.Namespace, deploy.Name, err)
+		return
+	}
+	
+	klog.Infof("Scaled down deployment %s/%s from %s to 0", deploy.Namespace, deploy.Name, originalScale)
+}
+
+func (c *Controller) scaleDeploymentUp(deploy *appsv1.Deployment, originalScaleStr string) {
+	var originalScale int32
+	fmt.Sscanf(originalScaleStr, "%d", &originalScale)
+	
+	// Skip if already scaled back
+	if *deploy.Spec.Replicas > 0 {
+		return
+	}
+	
+	// Set replicas to original scale
+	deploy.Spec.Replicas = &originalScale
+	
+	// Remove annotation
+	delete(deploy.Annotations, originalScaleAnnotation)
+	
+	// Update deployment
+	_, err := c.kubeClient.AppsV1().Deployments(deploy.Namespace).Update(context.Background(), deploy, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to scale up deployment %s/%s: %v", deploy.Namespace, deploy.Name, err)
+		return
+	}
+	
+	klog.Infof("Scaled up deployment %s/%s to %d", deploy.Namespace, deploy.Name, originalScale)
+}
+
+func (c *Controller) scaleStatefulSetDown(sts *appsv1.StatefulSet) {
+	// Skip if already scaled to 0
+	if *sts.Spec.Replicas == 0 {
+		return
+	}
+
+	// Remember original scale
+	originalScale := fmt.Sprintf("%d", *sts.Spec.Replicas)
+	
+	// Update annotations
+	if sts.Annotations == nil {
+		sts.Annotations = make(map[string]string)
+	}
+	sts.Annotations[originalScaleAnnotation] = originalScale
+	
+	// Set replicas to 0
+	replicas := int32(0)
+	sts.Spec.Replicas = &replicas
+	
+	// Update statefulset
+	_, err := c.kubeClient.AppsV1().StatefulSets(sts.Namespace).Update(context.Background(), sts, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to scale down statefulset %s/%s: %v", sts.Namespace, sts.Name, err)
+		return
+	}
+	
+	klog.Infof("Scaled down statefulset %s/%s from %s to 0", sts.Namespace, sts.Name, originalScale)
+}
+
+func (c *Controller) scaleStatefulSetUp(sts *appsv1.StatefulSet, originalScaleStr string) {
+	var originalScale int32
+	fmt.Sscanf(originalScaleStr, "%d", &originalScale)
+	
+	// Skip if already scaled back
+	if *sts.Spec.Replicas > 0 {
+		return
+	}
+	
+	// Set replicas to original scale
+	sts.Spec.Replicas = &originalScale
+	
+	// Remove annotation
+	delete(sts.Annotations, originalScaleAnnotation)
+	
+	// Update statefulset
+	_, err := c.kubeClient.AppsV1().StatefulSets(sts.Namespace).Update(context.Background(), sts, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to scale up statefulset %s/%s: %v", sts.Namespace, sts.Name, err)
+		return
+	}
+	
+	klog.Infof("Scaled up statefulset %s/%s to %d", sts.Namespace, sts.Name, originalScale)
 }
 
 func main() {
-        flag.Parse()
-        klog.InitFlags(nil)
+	klog.InitFlags(nil)
+	flag.Parse()
 
-        // Configuration pour se connecter au cluster
-        var config *rest.Config
-        var err error
+	// Get kubeconfig
+	kubeconfigPath := os.Getenv("KUBECONFIG")
+	if kubeconfigPath == "" {
+		kubeconfigPath = os.Getenv("HOME") + "/.kube/config"
+	}
 
-        if kubeconfig == "" {
-                klog.Info("Utilisation de la configuration in-cluster")
-                config, err = rest.InClusterConfig()
-        } else {
-                klog.Infof("Utilisation du kubeconfig: %s", kubeconfig)
-                config, err = clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
-        }
-        if err != nil {
-                klog.Fatalf("Erreur lors de la création de la configuration: %s", err.Error())
-        }
+	// Create kubernetes client
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		klog.Fatalf("Error building kubeconfig: %s", err.Error())
+	}
 
-        // Création du client Kubernetes
-        clientset, err := kubernetes.NewForConfig(config)
-        if err != nil {
-                klog.Fatalf("Erreur lors de la création du client: %s", err.Error())
-        }
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
+	}
 
-        // Configuration de l'élection du leader
-        id, err := os.Hostname()
-        if err != nil {
-                klog.Fatalf("Erreur lors de la récupération du hostname: %s", err.Error())
-        }
+	// Create shared informer factory
+	factory := informers.NewSharedInformerFactory(kubeClient, time.Hour*12)
 
-        // Détermination du namespace pour le lock
-        lockNamespace := os.Getenv("POD_NAMESPACE")
-        if lockNamespace == "" {
-                lockNamespace = "default"
-        }
+	// Create controller
+	controller := NewController(kubeClient, factory)
 
-        lock := &resourcelock.LeaseLock{
-                LeaseMeta: metav1.ObjectMeta{
-                        Name:      lockName,
-                        Namespace: lockNamespace,
-                },
-                Client: clientset.CoordinationV1(),
-                LockConfig: resourcelock.ResourceLockConfig{
-                        Identity: id,
-                },
-        }
+	// Leader election setup
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			klog.Fatalf("Failed to get hostname: %v", err)
+		}
+		podName = hostname
+	}
 
-        // Démarrage de l'élection du leader
-        leaderelection.RunOrDie(context.Background(), leaderelection.LeaderElectionConfig{
-                Lock:            lock,
-                ReleaseOnCancel: true,
-                LeaseDuration:   15 * time.Second,
-                RenewDeadline:   10 * time.Second,
-                RetryPeriod:     2 * time.Second,
-                Callbacks: leaderelection.LeaderCallbacks{
-                        OnStartedLeading: func(ctx context.Context) {
-                                klog.Info("Élu comme leader, démarrage des opérations")
-                                run(ctx, clientset)
-                        },
-                        OnStoppedLeading: func() {
-                                klog.Info("Leadership perdu, arrêt des opérations")
-                                os.Exit(0)
-                        },
-                        OnNewLeader: func(identity string) {
-                                if identity == id {
-                                        return
-                                }
-                                klog.Infof("Nouveau leader élu: %s", identity)
-                        },
-                },
-        })
-}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "default"
+	}
 
-func run(ctx context.Context, clientset *kubernetes.Clientset) {
-        ticker := time.NewTicker(time.Duration(interval) * time.Second)
-        defer ticker.Stop()
+	// Leader election config
+	leaderElectionConfig := leaderelection.LeaderElectionConfig{
+		Lock: &resourcelock.LeaseLock{
+			LeaseMeta: metav1.ObjectMeta{
+				Name:      "node-watcher-operator",
+				Namespace: namespace,
+			},
+			Client: kubeClient.CoordinationV1(),
+			LockConfig: resourcelock.ResourceLockConfig{
+				Identity: podName,
+			},
+		},
+		LeaseDuration: 15 * time.Second,
+		RenewDeadline: 10 * time.Second,
+		RetryPeriod:   2 * time.Second,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+				// Start informers
+				stopCh := make(chan struct{})
+				factory.Start(stopCh)
 
-        for {
-                select {
-                case <-ctx.Done():
-                        return
-                case <-ticker.C:
-                        handleNodeDownScaling(ctx, clientset)
-                }
-        }
-}
+				// Run controller
+				if err := controller.Run(2, stopCh); err != nil {
+					klog.Fatalf("Error running controller: %s", err.Error())
+				}
+			},
+			OnStoppedLeading: func() {
+				klog.Info("Leader election lost")
+				os.Exit(0)
+			},
+			OnNewLeader: func(identity string) {
+				if identity == podName {
+					klog.Info("Still the leader!")
+				} else {
+					klog.Infof("New leader elected: %s", identity)
+				}
+			},
+		},
+		ReleaseOnCancel: true,
+	}
 
-func handleNodeDownScaling(ctx context.Context, clientset *kubernetes.Clientset) {
-        // Récupération des nœuds en état NotReady
-        nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération des nœuds: %s", err.Error())
-                return
-        }
+	// Start leader election
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-        downNodes := make(map[string]bool)
-        for _, node := range nodes.Items {
-                for _, condition := range node.Status.Conditions {
-                        if condition.Type == corev1.NodeReady && condition.Status != corev1.ConditionTrue {
-                                klog.Infof("Nœud en panne détecté: %s", node.Name)
-                                downNodes[node.Name] = true
-                        }
-                }
-        }
+	// Handle signals
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalCh
+		klog.Info("Received termination signal")
+		cancel()
+	}()
 
-        if len(downNodes) == 0 {
-                klog.Info("Aucun nœud en panne détecté")
-                return
-        }
-
-        // Récupération de la ConfigMap avec la configuration des workloads
-        configMap, err := clientset.CoreV1().ConfigMaps(configMapNs).Get(ctx, configMapName, metav1.GetOptions{})
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération de la ConfigMap %s/%s: %s", configMapNs, configMapName, err.Error())
-
-                // Si la ConfigMap n'existe pas, on utilise la méthode par labels
-                klog.Info("Utilisation du mode de sélection par labels comme fallback")
-                useLabelsBasedSelection(ctx, clientset, downNodes)
-                return
-        }
-
-        // Parcourir les données de la ConfigMap pour trouver les workloads à scaler
-        for key, value := range configMap.Data {
-                parts := strings.Split(value, "/")
-                if len(parts) != 2 {
-                        klog.Warningf("Format invalide pour l'entrée %s: %s (format attendu: type/namespace)", key, value)
-                        continue
-                }
-
-                workloadType := parts[0]
-                workloadNamespace := parts[1]
-
-                switch workloadType {
-                case "deployment":
-                        scaleSpecificDeployment(ctx, clientset, key, workloadNamespace)
-                case "statefulset":
-                        scaleSpecificStatefulSet(ctx, clientset, key, workloadNamespace)
-                default:
-                        klog.Warningf("Type de workload non supporté: %s", workloadType)
-                }
-        }
-}
-
-func useLabelsBasedSelection(ctx context.Context, clientset *kubernetes.Clientset, downNodes map[string]bool) {
-        // Construction du sélecteur de labels
-        labelReq, err := labels.ParseToRequirements(labelSelector)
-        if err != nil {
-                klog.Errorf("Erreur lors du parsing du sélecteur de labels: %s", err.Error())
-                return
-        }
-
-        selector := labels.NewSelector()
-        for _, req := range labelReq {
-                selector = selector.Add(req)
-        }
-
-        // Traitement des Deployments
-        scaleDeploymentsByLabels(ctx, clientset, selector)
-
-        // Traitement des StatefulSets
-        scaleStatefulSetsByLabels(ctx, clientset, selector)
-}
-
-func scaleDeploymentsByLabels(ctx context.Context, clientset *kubernetes.Clientset, selector labels.Selector) {
-        var deployments *appsv1.DeploymentList
-        var err error
-
-        if namespace == "" {
-                deployments, err = clientset.AppsV1().Deployments("").List(ctx, metav1.ListOptions{
-                        LabelSelector: selector.String(),
-                })
-        } else {
-                deployments, err = clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{
-                        LabelSelector: selector.String(),
-                })
-        }
-
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération des deployments: %s", err.Error())
-                return
-        }
-
-        for _, deploy := range deployments.Items {
-                if deploy.Spec.Replicas != nil && *deploy.Spec.Replicas > 0 {
-                        scaleToZero(ctx, clientset, deploy.Name, deploy.Namespace, "deployment")
-                }
-        }
-}
-
-func scaleStatefulSetsByLabels(ctx context.Context, clientset *kubernetes.Clientset, selector labels.Selector) {
-        var statefulSets *appsv1.StatefulSetList
-        var err error
-
-        if namespace == "" {
-                statefulSets, err = clientset.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{
-                        LabelSelector: selector.String(),
-                })
-        } else {
-                statefulSets, err = clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{
-                        LabelSelector: selector.String(),
-                })
-        }
-
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération des statefulsets: %s", err.Error())
-                return
-        }
-
-        for _, sts := range statefulSets.Items {
-                if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
-                        scaleToZero(ctx, clientset, sts.Name, sts.Namespace, "statefulset")
-                }
-        }
-}
-
-func scaleSpecificDeployment(ctx context.Context, clientset *kubernetes.Clientset, name, workloadNamespace string) {
-        deployment, err := clientset.AppsV1().Deployments(workloadNamespace).Get(ctx, name, metav1.GetOptions{})
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération du deployment %s/%s: %s", workloadNamespace, name, err.Error())
-                return
-        }
-
-        if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas > 0 {
-                scaleToZero(ctx, clientset, name, workloadNamespace, "deployment")
-        }
-}
-
-func scaleSpecificStatefulSet(ctx context.Context, clientset *kubernetes.Clientset, name, workloadNamespace string) {
-        statefulSet, err := clientset.AppsV1().StatefulSets(workloadNamespace).Get(ctx, name, metav1.GetOptions{})
-        if err != nil {
-                klog.Errorf("Erreur lors de la récupération du statefulset %s/%s: %s", workloadNamespace, name, err.Error())
-                return
-        }
-
-        if statefulSet.Spec.Replicas != nil && *statefulSet.Spec.Replicas > 0 {
-                scaleToZero(ctx, clientset, name, workloadNamespace, "statefulset")
-        }
-}
-
-func scaleToZero(ctx context.Context, clientset *kubernetes.Clientset, name, ns, kind string) {
-        klog.Infof("Scaling à zéro le %s %s/%s", kind, ns, name)
-
-        if kind == "deployment" {
-                deployment, err := clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-                if err != nil {
-                        klog.Errorf("Erreur lors de la récupération du deployment %s/%s: %s", ns, name, err.Error())
-                        return
-                }
-
-                // Sauvegarder le nombre de replicas actuel comme annotation
-                if deployment.Annotations == nil {
-                        deployment.Annotations = make(map[string]string)
-                }
-
-                // Ne pas écraser l'annotation si elle existe déjà
-                if _, exists := deployment.Annotations["original-replicas"]; !exists {
-                        deployment.Annotations["original-replicas"] = fmt.Sprintf("%d", *deployment.Spec.Replicas)
-                }
-
-                // Mise à jour des replicas à 0
-                zero := int32(0)
-                deployment.Spec.Replicas = &zero
-
-                _, err = clientset.AppsV1().Deployments(ns).Update(ctx, deployment, metav1.UpdateOptions{})
-                if err != nil {
-                        klog.Errorf("Erreur lors du scaling du deployment %s/%s: %s", ns, name, err.Error())
-                } else {
-                        klog.Infof("Deployment %s/%s scaled à zéro avec succès", ns, name)
-                }
-        } else if kind == "statefulset" {
-                statefulSet, err := clientset.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
-                if err != nil {
-                        klog.Errorf("Erreur lors de la récupération du statefulset %s/%s: %s", ns, name, err.Error())
-                        return
-                }
-
-                // Sauvegarder le nombre de replicas actuel comme annotation
-                if statefulSet.Annotations == nil {
-                        statefulSet.Annotations = make(map[string]string)
-                }
-
-                // Ne pas écraser l'annotation si elle existe déjà
-                if _, exists := statefulSet.Annotations["original-replicas"]; !exists {
-                        statefulSet.Annotations["original-replicas"] = fmt.Sprintf("%d", *statefulSet.Spec.Replicas)
-                }
-
-                // Mise à jour des replicas à 0
-                zero := int32(0)
-                statefulSet.Spec.Replicas = &zero
-
-                _, err = clientset.AppsV1().StatefulSets(ns).Update(ctx, statefulSet, metav1.UpdateOptions{})
-                if err != nil {
-                        klog.Errorf("Erreur lors du scaling du statefulset %s/%s: %s", ns, name, err.Error())
-                } else {
-                        klog.Infof("StatefulSet %s/%s scaled à zéro avec succès", ns, name)
-                }
-        }
+	// Start leader election
+	klog.Info("Starting leader election")
+	leaderelection.RunOrDie(ctx, leaderElectionConfig)
 }
